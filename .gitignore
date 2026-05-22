@@ -1,0 +1,17 @@
+build/
+*.dat
+*.pem
+*.log
+*.conf
+*tmp*
+/ci/scratch/
+/releases
+*.pyc
+target/
+.DS_Store
+.vscode/
+.idea/
+*.o
+*.a
+*.so
+depends/
