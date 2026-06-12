@@ -1,547 +1,429 @@
-// Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-present The Bitcoin Core developers
+// Copyright (c) 2023-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <node/miner.h>
+#include <node/mini_miner.h>
 
-#include <chain.h>
-#include <chainparams.h>
-#include <coins.h>
-#include <common/args.h>
+#include <boost/multi_index/detail/hash_index_iterator.hpp>
+#include <boost/operators.hpp>
 #include <consensus/amount.h>
-#include <consensus/consensus.h>
-#include <consensus/merkle.h>
-#include <consensus/tx_verify.h>
-#include <consensus/validation.h>
-#include <deploymentstatus.h>
-#include <logging.h>
-#include <node/context.h>
-#include <node/kernel_notifications.h>
 #include <policy/feerate.h>
-#include <policy/policy.h>
-#include <pow.h>
 #include <primitives/transaction.h>
-#include <util/moneystr.h>
-#include <util/signalinterrupt.h>
-#include <util/time.h>
-#include <validation.h>
+#include <sync.h>
+#include <txmempool.h>
+#include <uint256.h>
+#include <util/check.h>
 
 #include <algorithm>
-#include <utility>
 #include <numeric>
+#include <ranges>
+#include <utility>
 
 namespace node {
 
-int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const int64_t difficulty_adjustment_interval)
+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)
 {
-    int64_t min_time{pindexPrev->GetMedianTimePast() + 1};
-    // Height of block to be mined.
-    const int height{pindexPrev->nHeight + 1};
-    // Account for BIP94 timewarp rule on all networks. This makes future
-    // activation safer.
-    if (height % difficulty_adjustment_interval == 0) {
-        min_time = std::max<int64_t>(min_time, pindexPrev->GetBlockTime() - MAX_TIMEWARP);
-    }
-    return min_time;
-}
+    LOCK(mempool.cs);
+    // Find which outpoints to calculate bump fees for.
+    // Anything that's spent by the mempool is to-be-replaced
+    // Anything otherwise unavailable just has a bump fee of 0
+    for (const auto& outpoint : outpoints) {
+        if (!mempool.exists(outpoint.hash)) {
+            // This UTXO is either confirmed or not yet submitted to mempool.
+            // If it's confirmed, no bump fee is required.
+            // If it's not yet submitted, we have no information, so return 0.
+            m_bump_fees.emplace(outpoint, 0);
+            continue;
+        }
 
-int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev)
-{
-    int64_t nOldTime = pblock->nTime;
-    int64_t nNewTime{std::max<int64_t>(GetMinimumTime(pindexPrev, consensusParams.DifficultyAdjustmentInterval()),
-                                       TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()))};
+        // UXTO is created by transaction in mempool, add to map.
+        // Note: This will either create a missing entry or add the outpoint to an existing entry
+        m_requested_outpoints_by_txid[outpoint.hash].push_back(outpoint);
 
-    if (nOldTime < nNewTime) {
-        pblock->nTime = nNewTime;
-    }
-
-    // Updating time can change work required on testnet:
-    if (consensusParams.fPowAllowMinDifficultyBlocks) {
-        pblock->nBits = GetNextWorkRequired(pindexPrev, pblock, consensusParams);
-    }
-
-    return nNewTime - nOldTime;
-}
-
-void RegenerateCommitments(CBlock& block, ChainstateManager& chainman)
-{
-    CMutableTransaction tx{*block.vtx.at(0)};
-    tx.vout.erase(tx.vout.begin() + GetWitnessCommitmentIndex(block));
-    block.vtx.at(0) = MakeTransactionRef(tx);
-
-    const CBlockIndex* prev_block = WITH_LOCK(::cs_main, return chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock));
-    chainman.GenerateCoinbaseCommitment(block, prev_block);
-
-    block.hashMerkleRoot = BlockMerkleRoot(block);
-}
-
-static BlockAssembler::Options ClampOptions(BlockAssembler::Options options)
-{
-    // Apply DEFAULT_BLOCK_RESERVED_WEIGHT when the caller left it unset.
-    options.block_reserved_weight = std::clamp<size_t>(options.block_reserved_weight.value_or(DEFAULT_BLOCK_RESERVED_WEIGHT), MINIMUM_BLOCK_RESERVED_WEIGHT, MAX_BLOCK_WEIGHT);
-    options.coinbase_output_max_additional_sigops = std::clamp<size_t>(options.coinbase_output_max_additional_sigops, 0, MAX_BLOCK_SIGOPS_COST);
-    // Limit weight to between block_reserved_weight and MAX_BLOCK_WEIGHT for sanity:
-    // block_reserved_weight can safely exceed -blockmaxweight, but the rest of the block template will be empty.
-    options.nBlockMaxWeight = std::clamp<size_t>(options.nBlockMaxWeight, *options.block_reserved_weight, MAX_BLOCK_WEIGHT);
-    return options;
-}
-
-BlockAssembler::BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options)
-    : chainparams{chainstate.m_chainman.GetParams()},
-      m_mempool{options.use_mempool ? mempool : nullptr},
-      m_chainstate{chainstate},
-      m_options{ClampOptions(options)}
-{
-}
-
-void ApplyArgsManOptions(const ArgsManager& args, BlockAssembler::Options& options)
-{
-    // Block resource limits
-    options.nBlockMaxWeight = args.GetIntArg("-blockmaxweight", options.nBlockMaxWeight);
-    if (const auto blockmintxfee{args.GetArg("-blockmintxfee")}) {
-        if (const auto parsed{ParseMoney(*blockmintxfee)}) options.blockMinFeeRate = CFeeRate{*parsed};
-    }
-    options.print_modified_fee = args.GetBoolArg("-printpriority", options.print_modified_fee);
-    if (!options.block_reserved_weight) {
-        options.block_reserved_weight = args.GetIntArg("-blockreservedweight");
-    }
-}
-
-void BlockAssembler::resetBlock()
-{
-    // Reserve space for fixed-size block header, txs count, and coinbase tx.
-    nBlockWeight = *Assert(m_options.block_reserved_weight);
-    nBlockSigOpsCost = m_options.coinbase_output_max_additional_sigops;
-
-    // These counters do not include coinbase tx
-    nBlockTx = 0;
-    nFees = 0;
-}
-
-std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
-{
-    const auto time_start{SteadyClock::now()};
-
-    resetBlock();
-
-    pblocktemplate.reset(new CBlockTemplate());
-    CBlock* const pblock = &pblocktemplate->block; // pointer for convenience
-
-    // Add dummy coinbase tx as first transaction. It is skipped by the
-    // getblocktemplate RPC and mining interface consumers must not use it.
-    pblock->vtx.emplace_back();
-
-    LOCK(::cs_main);
-    CBlockIndex* pindexPrev = m_chainstate.m_chain.Tip();
-    assert(pindexPrev != nullptr);
-    nHeight = pindexPrev->nHeight + 1;
-
-    pblock->nVersion = m_chainstate.m_chainman.m_versionbitscache.ComputeBlockVersion(pindexPrev, chainparams.GetConsensus());
-    // -regtest only: allow overriding block.nVersion with
-    // -blockversion=N to test forking scenarios
-    if (chainparams.MineBlocksOnDemand()) {
-        pblock->nVersion = gArgs.GetIntArg("-blockversion", pblock->nVersion);
-    }
-
-    pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
-    m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
-
-    if (m_mempool) {
-        LOCK(m_mempool->cs);
-        m_mempool->StartBlockBuilding();
-        addChunks();
-        m_mempool->StopBlockBuilding();
-    }
-
-    const auto time_1{SteadyClock::now()};
-
-    m_last_block_num_txs = nBlockTx;
-    m_last_block_weight = nBlockWeight;
-
-    // Create coinbase transaction.
-    CMutableTransaction coinbaseTx;
-
-    // Construct coinbase transaction struct in parallel
-    CoinbaseTx& coinbase_tx{pblocktemplate->m_coinbase_tx};
-    coinbase_tx.version = coinbaseTx.version;
-
-    coinbaseTx.vin.resize(1);
-    coinbaseTx.vin[0].prevout.SetNull();
-    coinbaseTx.vin[0].nSequence = CTxIn::MAX_SEQUENCE_NONFINAL; // Make sure timelock is enforced.
-    coinbase_tx.sequence = coinbaseTx.vin[0].nSequence;
-
-    // Add an output that spends the full coinbase reward.
-    coinbaseTx.vout.resize(1);
-    coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
-    // Block subsidy + fees
-    // --- TARA FEE LOGIC ---
-    // #1 1.5% transaction tax to LP
-    CAmount lpTax = (nFees * 15) / 1000;
-    nFees -= lpTax;
-    g_treasury.polBalance += lpTax;
-    // #6 Buyback: 0.5% of fees to LP
-    CAmount buybackAmount = (nFees * 5) / 1000;
-    nFees -= buybackAmount;
-    g_treasury.polBalance += buybackAmount;
-    // #4 LP reward: 1 TARA per block
-    CAmount lpReward = COIN;
-    g_treasury.polBalance += lpReward;
-    // #5 Slash redistribution
-    CAmount slashReward = 0;
-    if (g_validatorRegistry.Size() > 0 && g_slashedCoinsPending > 0) {
-        slashReward = g_slashedCoinsPending / g_validatorRegistry.Size();
-        g_slashedCoinsPending = 0;
-        g_treasury.polBalance += slashReward;
-    }
-    // Block subsidy + remaining fees + slash reward
-    const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus()) + slashReward};
-    coinbaseTx.vout[0].nValue = block_reward;
-    coinbase_tx.block_reward_remaining = block_reward;
-
-    // Start the coinbase scriptSig with the block height as required by BIP34.
-    // Mining clients are expected to append extra data to this prefix, so
-    // increasing its length would reduce the space they can use and may break
-    // existing clients.
-    coinbaseTx.vin[0].scriptSig = CScript() << nHeight;
-    if (m_options.include_dummy_extranonce) {
-        // For blocks at heights <= 16, the BIP34-encoded height alone is only
-        // one byte. Consensus requires coinbase scriptSigs to be at least two
-        // bytes long (bad-cb-length), so tests and regtest include a dummy
-        // extraNonce (OP_0)
-        coinbaseTx.vin[0].scriptSig << OP_0;
-    }
-    coinbase_tx.script_sig_prefix = coinbaseTx.vin[0].scriptSig;
-    Assert(nHeight > 0);
-    coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1);
-    coinbase_tx.lock_time = coinbaseTx.nLockTime;
-
-    pblock->vtx[0] = MakeTransactionRef(std::move(coinbaseTx));
-    m_chainstate.m_chainman.GenerateCoinbaseCommitment(*pblock, pindexPrev);
-
-    const CTransactionRef& final_coinbase{pblock->vtx[0]};
-    if (final_coinbase->HasWitness()) {
-        const auto& witness_stack{final_coinbase->vin[0].scriptWitness.stack};
-        // Consensus requires the coinbase witness stack to have exactly one
-        // element of 32 bytes.
-        Assert(witness_stack.size() == 1 && witness_stack[0].size() == 32);
-        coinbase_tx.witness = uint256(witness_stack[0]);
-    }
-    if (const int witness_index = GetWitnessCommitmentIndex(*pblock); witness_index != NO_WITNESS_COMMITMENT) {
-        Assert(witness_index >= 0 && static_cast<size_t>(witness_index) < final_coinbase->vout.size());
-        coinbase_tx.required_outputs.push_back(final_coinbase->vout[witness_index]);
-    }
-
-    LogInfo("CreateNewBlock(): block weight: %u txs: %u fees: %ld sigops %d\n", GetBlockWeight(*pblock), nBlockTx, nFees, nBlockSigOpsCost);
-
-    // Fill in header
-    pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
-    UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
-    pblock->nBits          = GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
-    pblock->nNonce         = 0;
-
-    if (m_options.test_block_validity) {
-        // if nHeight <= 16, and include_dummy_extranonce=false this will fail due to bad-cb-length.
-        if (BlockValidationState state{TestBlockValidity(m_chainstate, *pblock, /*check_pow=*/false, /*check_merkle_root=*/false)}; !state.IsValid()) {
-            throw std::runtime_error(strprintf("TestBlockValidity failed: %s", state.ToString()));
+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {
+            // This outpoint is already being spent by another transaction in the mempool. We
+            // assume that the caller wants to replace this transaction and its descendants. It
+            // would be unusual for the transaction to have descendants as the wallet won’t normally
+            // attempt to replace transactions with descendants. If the outpoint is from a mempool
+            // transaction, we still need to calculate its ancestors bump fees (added to
+            // m_requested_outpoints_by_txid below), but after removing the to-be-replaced entries.
+            //
+            // Note that the descendants of a transaction include the transaction itself. Also note,
+            // that this is only calculating bump fees. RBF fee rules should be handled separately.
+            CTxMemPool::setEntries descendants;
+            mempool.CalculateDescendants(mempool.GetIter(ptx->GetHash()).value(), descendants);
+            for (const auto& desc_txiter : descendants) {
+                m_to_be_replaced.insert(desc_txiter->GetTx().GetHash());
+            }
         }
     }
-    const auto time_2{SteadyClock::now()};
 
-    LogDebug(BCLog::BENCH, "CreateNewBlock() chunks: %.2fms, validity: %.2fms (total %.2fms)\n",
-             Ticks<MillisecondsDouble>(time_1 - time_start),
-             Ticks<MillisecondsDouble>(time_2 - time_1),
-             Ticks<MillisecondsDouble>(time_2 - time_start));
+    // No unconfirmed UTXOs, so nothing mempool-related needs to be calculated.
+    if (m_requested_outpoints_by_txid.empty()) return;
 
-    return std::move(pblocktemplate);
-}
-
-bool BlockAssembler::TestChunkBlockLimits(FeePerWeight chunk_feerate, int64_t chunk_sigops_cost) const
-{
-    if (nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight) {
-        return false;
+    // Calculate the cluster and construct the entry map.
+    auto txids_needed{m_requested_outpoints_by_txid | std::views::keys};
+    const auto cluster = mempool.GatherClusters({txids_needed.begin(), txids_needed.end()});
+    if (cluster.empty()) {
+        // An empty cluster means that at least one of the transactions is missing from the mempool
+        // (should not be possible given processing above) or DoS limit was hit.
+        m_ready_to_calculate = false;
+        return;
     }
-    if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST) {
-        return false;
-    }
-    return true;
-}
 
-// Perform transaction-level checks before adding to block:
-// - transaction finality (locktime)
-bool BlockAssembler::TestChunkTransactions(const std::vector<CTxMemPoolEntryRef>& txs) const
-{
-    for (const auto tx : txs) {
-        if (!IsFinalTx(tx.get().GetTx(), nHeight, m_lock_time_cutoff)) {
-            return false;
+    // Add every entry to m_entries_by_txid and m_entries, except the ones that will be replaced.
+    for (const auto& txiter : cluster) {
+        if (!m_to_be_replaced.contains(txiter->GetTx().GetHash())) {
+            auto [ancestor_count, ancestor_size, ancestor_fee] = mempool.CalculateAncestorData(*txiter);
+            auto [mapiter, success] = m_entries_by_txid.emplace(txiter->GetTx().GetHash(),
+                MiniMinerMempoolEntry{/*tx_in=*/txiter->GetSharedTx(),
+                                      /*vsize_self=*/txiter->GetTxSize(),
+                                      /*vsize_ancestor=*/int64_t(ancestor_size),
+                                      /*fee_self=*/txiter->GetModifiedFee(),
+                                      /*fee_ancestor=*/ancestor_fee});
+            m_entries.push_back(mapiter);
+        } else {
+            auto outpoints_it = m_requested_outpoints_by_txid.find(txiter->GetTx().GetHash());
+            if (outpoints_it != m_requested_outpoints_by_txid.end()) {
+                // This UTXO is the output of a to-be-replaced transaction. Bump fee is 0; spending
+                // this UTXO is impossible as it will no longer exist after the replacement.
+                for (const auto& outpoint : outpoints_it->second) {
+                    m_bump_fees.emplace(outpoint, 0);
+                }
+                m_requested_outpoints_by_txid.erase(outpoints_it);
+            }
         }
     }
-    return true;
-}
 
-void BlockAssembler::AddToBlock(const CTxMemPoolEntry& entry)
-{
-    pblocktemplate->block.vtx.emplace_back(entry.GetSharedTx());
-    pblocktemplate->vTxFees.push_back(entry.GetFee());
-    pblocktemplate->vTxSigOpsCost.push_back(entry.GetSigOpCost());
-    nBlockWeight += entry.GetTxWeight();
-    ++nBlockTx;
-    nBlockSigOpsCost += entry.GetSigOpCost();
-    nFees += entry.GetFee();
-
-    if (m_options.print_modified_fee) {
-        LogInfo("fee rate %s txid %s\n",
-                  CFeeRate(entry.GetModifiedFee(), entry.GetTxSize()).ToString(),
-                  entry.GetTx().GetHash().ToString());
+    // Build the m_descendant_set_by_txid cache.
+    for (const auto& txiter : cluster) {
+        const auto& txid = txiter->GetTx().GetHash();
+        // Cache descendants for future use. Unlike the real mempool, a descendant MiniMinerMempoolEntry
+        // will not exist without its ancestor MiniMinerMempoolEntry, so these sets won't be invalidated.
+        std::vector<MockEntryMap::iterator> cached_descendants;
+        const bool remove{m_to_be_replaced.contains(txid)};
+        CTxMemPool::setEntries descendants;
+        mempool.CalculateDescendants(txiter, descendants);
+        Assume(descendants.contains(txiter));
+        for (const auto& desc_txiter : descendants) {
+            const auto txid_desc = desc_txiter->GetTx().GetHash();
+            const bool remove_desc{m_to_be_replaced.contains(txid_desc)};
+            auto desc_it{m_entries_by_txid.find(txid_desc)};
+            Assume((desc_it == m_entries_by_txid.end()) == remove_desc);
+            if (remove) Assume(remove_desc);
+            // It's possible that remove=false but remove_desc=true.
+            if (!remove && !remove_desc) {
+                cached_descendants.push_back(desc_it);
+            }
+        }
+        if (remove) {
+            Assume(cached_descendants.empty());
+        } else {
+            m_descendant_set_by_txid.emplace(txid, cached_descendants);
+        }
     }
+
+    // Release the mempool lock; we now have all the information we need for a subset of the entries
+    // we care about. We will solely operate on the MiniMinerMempoolEntry map from now on.
+    Assume(m_in_block.empty());
+    Assume(m_requested_outpoints_by_txid.size() <= outpoints.size());
+    SanityCheck();
 }
 
-void BlockAssembler::addChunks()
+MiniMiner::MiniMiner(const std::vector<MiniMinerMempoolEntry>& manual_entries,
+                     const std::map<Txid, std::set<Txid>>& descendant_caches)
 {
-    // Limit the number of attempts to add transactions to the block when it is
-    // close to full; this is just a simple heuristic to finish quickly if the
-    // mempool has a lot of entries.
-    const int64_t MAX_CONSECUTIVE_FAILURES = 1000;
-    constexpr int32_t BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000;
-    int64_t nConsecutiveFailed = 0;
-
-    std::vector<CTxMemPoolEntry::CTxMemPoolEntryRef> selected_transactions;
-    selected_transactions.reserve(MAX_CLUSTER_COUNT_LIMIT);
-    FeePerWeight chunk_feerate;
-
-    // This fills selected_transactions
-    chunk_feerate = m_mempool->GetBlockBuilderChunk(selected_transactions);
-    FeePerVSize chunk_feerate_vsize = ToFeePerVSize(chunk_feerate);
-
-    while (selected_transactions.size() > 0) {
-        // Check to see if min fee rate is still respected.
-        if (chunk_feerate_vsize << m_options.blockMinFeeRate.GetFeePerVSize()) {
-            // Everything else we might consider has a lower feerate
+    for (const auto& entry : manual_entries) {
+        const auto& txid = entry.GetTx().GetHash();
+        // We need to know the descendant set of every transaction.
+        if (!Assume(descendant_caches.contains(txid))) {
+            m_ready_to_calculate = false;
             return;
         }
-
-        int64_t chunk_sig_ops = 0;
-        for (const auto& tx : selected_transactions) {
-            chunk_sig_ops += tx.get().GetSigOpCost();
+        // Just forward these args onto MiniMinerMempoolEntry
+        auto [mapiter, success] = m_entries_by_txid.emplace(txid, entry);
+        // Txids must be unique; this txid shouldn't already be an entry in m_entries_by_txid
+        if (Assume(success)) m_entries.push_back(mapiter);
+    }
+    // Descendant cache is already built, but we need to translate them to m_entries_by_txid iters.
+    for (const auto& [txid, desc_txids] : descendant_caches) {
+        // Descendant cache should include at least the tx itself.
+        if (!Assume(!desc_txids.empty())) {
+            m_ready_to_calculate = false;
+            return;
         }
-
-        // Check to see if this chunk will fit.
-        if (!TestChunkBlockLimits(chunk_feerate, chunk_sig_ops) || !TestChunkTransactions(selected_transactions)) {
-            // This chunk won't fit, so we skip it and will try the next best one.
-            m_mempool->SkipBuilderChunk();
-            ++nConsecutiveFailed;
-
-            if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES && nBlockWeight +
-                    BLOCK_FULL_ENOUGH_WEIGHT_DELTA > m_options.nBlockMaxWeight) {
-                // Give up if we're close to full and haven't succeeded in a while
+        std::vector<MockEntryMap::iterator> descendants;
+        for (const auto& desc_txid : desc_txids) {
+            auto desc_it{m_entries_by_txid.find(desc_txid)};
+            // Descendants should only include transactions with corresponding entries.
+            if (!Assume(desc_it != m_entries_by_txid.end())) {
+                m_ready_to_calculate = false;
                 return;
+            } else {
+                descendants.emplace_back(desc_it);
             }
-        } else {
-            m_mempool->IncludeBuilderChunk();
-
-            // This chunk will fit, so add it to the block.
-            nConsecutiveFailed = 0;
-            for (const auto& tx : selected_transactions) {
-                AddToBlock(tx);
-            }
-            pblocktemplate->m_package_feerates.emplace_back(chunk_feerate_vsize);
         }
+        m_descendant_set_by_txid.emplace(txid, descendants);
+    }
+    Assume(m_to_be_replaced.empty());
+    Assume(m_requested_outpoints_by_txid.empty());
+    Assume(m_bump_fees.empty());
+    Assume(m_inclusion_order.empty());
+    SanityCheck();
+}
 
-        selected_transactions.clear();
-        chunk_feerate = m_mempool->GetBlockBuilderChunk(selected_transactions);
-        chunk_feerate_vsize = ToFeePerVSize(chunk_feerate);
+// Compare by min(ancestor feerate, individual feerate), then txid
+//
+// Under the ancestor-based mining approach, high-feerate children can pay for parents, but high-feerate
+// parents do not incentive inclusion of their children. Therefore the mining algorithm only considers
+// transactions for inclusion on basis of the minimum of their own feerate or their ancestor feerate.
+struct AncestorFeerateComparator
+{
+    template<typename I>
+    bool operator()(const I& a, const I& b) const {
+        auto min_feerate = [](const MiniMinerMempoolEntry& e) -> FeeFrac {
+            FeeFrac self_feerate(e.GetModifiedFee(), e.GetTxSize());
+            FeeFrac ancestor_feerate(e.GetModFeesWithAncestors(), e.GetSizeWithAncestors());
+            return std::min(ancestor_feerate, self_feerate);
+        };
+        FeeFrac a_feerate{min_feerate(a->second)};
+        FeeFrac b_feerate{min_feerate(b->second)};
+        if (a_feerate != b_feerate) {
+            return a_feerate > b_feerate;
+        }
+        // Use txid as tiebreaker for stable sorting
+        return a->first < b->first;
+    }
+};
+
+void MiniMiner::DeleteAncestorPackage(const std::set<MockEntryMap::iterator, IteratorComparator>& ancestors)
+{
+    Assume(ancestors.size() >= 1);
+    // "Mine" all transactions in this ancestor set.
+    for (auto& anc : ancestors) {
+        Assume(!m_in_block.contains(anc->first));
+        m_in_block.insert(anc->first);
+        m_total_fees += anc->second.GetModifiedFee();
+        m_total_vsize += anc->second.GetTxSize();
+        auto it = m_descendant_set_by_txid.find(anc->first);
+        // Each entry’s descendant set includes itself
+        Assume(it != m_descendant_set_by_txid.end());
+        for (auto& descendant : it->second) {
+            // If this fails, we must be double-deducting. Don't check fees because negative is possible.
+            Assume(descendant->second.GetSizeWithAncestors() >= anc->second.GetTxSize());
+            descendant->second.UpdateAncestorState(-anc->second.GetTxSize(), -anc->second.GetModifiedFee());
+        }
+    }
+    // Delete these entries.
+    for (const auto& anc : ancestors) {
+        m_descendant_set_by_txid.erase(anc->first);
+        // The above loop should have deducted each ancestor's size and fees from each of their
+        // respective descendants exactly once.
+        Assume(anc->second.GetModFeesWithAncestors() == 0);
+        Assume(anc->second.GetSizeWithAncestors() == 0);
+        auto vec_it = std::find(m_entries.begin(), m_entries.end(), anc);
+        Assume(vec_it != m_entries.end());
+        m_entries.erase(vec_it);
+        m_entries_by_txid.erase(anc);
     }
 }
 
-void AddMerkleRootAndCoinbase(CBlock& block, CTransactionRef coinbase, uint32_t version, uint32_t timestamp, uint32_t nonce)
+void MiniMiner::SanityCheck() const
 {
-    if (block.vtx.size() == 0) {
-        block.vtx.emplace_back(coinbase);
+    // m_entries, m_entries_by_txid, and m_descendant_set_by_txid all same size
+    Assume(m_entries.size() == m_entries_by_txid.size());
+    Assume(m_entries.size() == m_descendant_set_by_txid.size());
+    // Cached ancestor values should be at least as large as the transaction's own size
+    Assume(std::all_of(m_entries.begin(), m_entries.end(), [](const auto& entry) {
+        return entry->second.GetSizeWithAncestors() >= entry->second.GetTxSize();}));
+    // None of the entries should be to-be-replaced transactions
+    Assume(std::all_of(m_to_be_replaced.begin(), m_to_be_replaced.end(),
+        [&](const auto& txid){ return !m_entries_by_txid.contains(txid); }));
+}
+
+void MiniMiner::BuildMockTemplate(std::optional<CFeeRate> target_feerate)
+{
+    const auto num_txns{m_entries_by_txid.size()};
+    uint32_t sequence_num{0};
+    while (!m_entries_by_txid.empty()) {
+        // Sort again, since transaction removal may change some m_entries' ancestor feerates.
+        std::sort(m_entries.begin(), m_entries.end(), AncestorFeerateComparator());
+
+        // Pick highest ancestor feerate entry.
+        auto best_iter = m_entries.begin();
+        Assume(best_iter != m_entries.end());
+        const auto ancestor_package_size = (*best_iter)->second.GetSizeWithAncestors();
+        const auto ancestor_package_fee = (*best_iter)->second.GetModFeesWithAncestors();
+        // Stop here. Everything that didn't "make it into the block" has bumpfee.
+        if (target_feerate.has_value() &&
+            ancestor_package_fee < target_feerate->GetFee(ancestor_package_size)) {
+            break;
+        }
+
+        // Calculate ancestors on the fly. This lookup should be fairly cheap, and ancestor sets
+        // change at every iteration, so this is more efficient than maintaining a cache.
+        std::set<MockEntryMap::iterator, IteratorComparator> ancestors;
+        {
+            std::set<MockEntryMap::iterator, IteratorComparator> to_process;
+            to_process.insert(*best_iter);
+            while (!to_process.empty()) {
+                auto iter = to_process.begin();
+                Assume(iter != to_process.end());
+                ancestors.insert(*iter);
+                for (const auto& input : (*iter)->second.GetTx().vin) {
+                    if (auto parent_it{m_entries_by_txid.find(input.prevout.hash)}; parent_it != m_entries_by_txid.end()) {
+                        if (!ancestors.contains(parent_it)) {
+                            to_process.insert(parent_it);
+                        }
+                    }
+                }
+                to_process.erase(iter);
+            }
+        }
+        // Track the order in which transactions were selected.
+        for (const auto& ancestor : ancestors) {
+            m_inclusion_order.emplace(ancestor->first, sequence_num);
+        }
+        DeleteAncestorPackage(ancestors);
+        SanityCheck();
+        ++sequence_num;
+    }
+    if (!target_feerate.has_value()) {
+        Assume(m_in_block.size() == num_txns);
     } else {
-        block.vtx[0] = coinbase;
+        Assume(m_in_block.empty() || m_total_fees >= target_feerate->GetFee(m_total_vsize));
     }
-    block.nVersion = version;
-    block.nTime = timestamp;
-    block.nNonce = nonce;
-    block.hashMerkleRoot = BlockMerkleRoot(block);
-
-    // Reset cached checks
-    block.m_checked_witness_commitment = false;
-    block.m_checked_merkle_root = false;
-    block.fChecked = false;
+    Assume(m_in_block.empty() || sequence_num > 0);
+    Assume(m_in_block.size() == m_inclusion_order.size());
+    // Do not try to continue building the block template with a different feerate.
+    m_ready_to_calculate = false;
 }
 
-void InterruptWait(KernelNotifications& kernel_notifications, bool& interrupt_wait)
+
+std::map<Txid, uint32_t> MiniMiner::Linearize()
 {
-    LOCK(kernel_notifications.m_tip_block_mutex);
-    interrupt_wait = true;
-    kernel_notifications.m_tip_block_cv.notify_all();
+    BuildMockTemplate(std::nullopt);
+    return m_inclusion_order;
 }
 
-std::unique_ptr<CBlockTemplate> WaitAndCreateNewBlock(ChainstateManager& chainman,
-                                                      KernelNotifications& kernel_notifications,
-                                                      CTxMemPool* mempool,
-                                                      const std::unique_ptr<CBlockTemplate>& block_template,
-                                                      const BlockWaitOptions& options,
-                                                      const BlockAssembler::Options& assemble_options,
-                                                      bool& interrupt_wait)
+std::map<COutPoint, CAmount> MiniMiner::CalculateBumpFees(const CFeeRate& target_feerate)
 {
-    // Delay calculating the current template fees, just in case a new block
-    // comes in before the next tick.
-    CAmount current_fees = -1;
+    if (!m_ready_to_calculate) return {};
+    // Build a block template until the target feerate is hit.
+    BuildMockTemplate(target_feerate);
 
-    // Alternate waiting for a new tip and checking if fees have risen.
-    // The latter check is expensive so we only run it once per second.
-    auto now{NodeClock::now()};
-    const auto deadline = now + options.timeout;
-    const MillisecondsDouble tick{1000};
-    const bool allow_min_difficulty{chainman.GetParams().GetConsensus().fPowAllowMinDifficultyBlocks};
-
-    do {
-        bool tip_changed{false};
-        {
-            WAIT_LOCK(kernel_notifications.m_tip_block_mutex, lock);
-            // Note that wait_until() checks the predicate before waiting
-            kernel_notifications.m_tip_block_cv.wait_until(lock, std::min(now + tick, deadline), [&]() EXCLUSIVE_LOCKS_REQUIRED(kernel_notifications.m_tip_block_mutex) {
-                AssertLockHeld(kernel_notifications.m_tip_block_mutex);
-                const auto tip_block{kernel_notifications.TipBlock()};
-                // We assume tip_block is set, because this is an instance
-                // method on BlockTemplate and no template could have been
-                // generated before a tip exists.
-                tip_changed = Assume(tip_block) && tip_block != block_template->block.hashPrevBlock;
-                return tip_changed || chainman.m_interrupt || interrupt_wait;
-            });
-            if (interrupt_wait) {
-                interrupt_wait = false;
-                return nullptr;
+    // Each transaction that "made it into the block" has a bumpfee of 0, i.e. they are part of an
+    // ancestor package with at least the target feerate and don't need to be bumped.
+    for (const auto& txid : m_in_block) {
+        // Not all of the block transactions were necessarily requested.
+        auto it = m_requested_outpoints_by_txid.find(txid);
+        if (it != m_requested_outpoints_by_txid.end()) {
+            for (const auto& outpoint : it->second) {
+                m_bump_fees.emplace(outpoint, 0);
             }
-        }
-
-        if (chainman.m_interrupt) return nullptr;
-        // At this point the tip changed, a full tick went by or we reached
-        // the deadline.
-
-        // Must release m_tip_block_mutex before locking cs_main, to avoid deadlocks.
-        LOCK(::cs_main);
-
-        // On test networks return a minimum difficulty block after 20 minutes
-        if (!tip_changed && allow_min_difficulty) {
-            const NodeClock::time_point tip_time{std::chrono::seconds{chainman.ActiveChain().Tip()->GetBlockTime()}};
-            if (now > tip_time + 20min) {
-                tip_changed = true;
-            }
-        }
-
-        /**
-         * We determine if fees increased compared to the previous template by generating
-         * a fresh template. There may be more efficient ways to determine how much
-         * (approximate) fees for the next block increased, perhaps more so after
-         * Cluster Mempool.
-         *
-         * We'll also create a new template if the tip changed during this iteration.
-         */
-        if (options.fee_threshold < MAX_MONEY || tip_changed) {
-            auto new_tmpl{BlockAssembler{
-                chainman.ActiveChainstate(),
-                mempool,
-                assemble_options}
-                              .CreateNewBlock()};
-
-            // If the tip changed, return the new template regardless of its fees.
-            if (tip_changed) return new_tmpl;
-
-            // Calculate the original template total fees if we haven't already
-            if (current_fees == -1) {
-                current_fees = std::accumulate(block_template->vTxFees.begin(), block_template->vTxFees.end(), CAmount{0});
-            }
-
-            // Check if fees increased enough to return the new template
-            const CAmount new_fees = std::accumulate(new_tmpl->vTxFees.begin(), new_tmpl->vTxFees.end(), CAmount{0});
-            Assume(options.fee_threshold != MAX_MONEY);
-            if (new_fees >= current_fees + options.fee_threshold) return new_tmpl;
-        }
-
-        now = NodeClock::now();
-    } while (now < deadline);
-
-    return nullptr;
-}
-
-std::optional<BlockRef> GetTip(ChainstateManager& chainman)
-{
-    LOCK(::cs_main);
-    CBlockIndex* tip{chainman.ActiveChain().Tip()};
-    if (!tip) return {};
-    return BlockRef{tip->GetBlockHash(), tip->nHeight};
-}
-
-bool CooldownIfHeadersAhead(ChainstateManager& chainman, KernelNotifications& kernel_notifications, const BlockRef& last_tip, bool& interrupt_mining)
-{
-    uint256 last_tip_hash{last_tip.hash};
-
-    while (const std::optional<int> remaining = chainman.BlocksAheadOfTip()) {
-        const int cooldown_seconds = std::clamp(*remaining, 3, 20);
-        const auto cooldown_deadline{MockableSteadyClock::now() + std::chrono::seconds{cooldown_seconds}};
-
-        {
-            WAIT_LOCK(kernel_notifications.m_tip_block_mutex, lock);
-            kernel_notifications.m_tip_block_cv.wait_until(lock, cooldown_deadline, [&]() EXCLUSIVE_LOCKS_REQUIRED(kernel_notifications.m_tip_block_mutex) {
-                const auto tip_block = kernel_notifications.TipBlock();
-                return chainman.m_interrupt || interrupt_mining || (tip_block && *tip_block != last_tip_hash);
-            });
-            if (chainman.m_interrupt || interrupt_mining) {
-                interrupt_mining = false;
-                return false;
-            }
-
-            // If the tip changed during the wait, extend the deadline
-            const auto tip_block = kernel_notifications.TipBlock();
-            if (tip_block && *tip_block != last_tip_hash) {
-                last_tip_hash = *tip_block;
-                continue;
-            }
-        }
-
-        // No tip change and the cooldown window has expired.
-        if (MockableSteadyClock::now() >= cooldown_deadline) break;
-    }
-
-    return true;
-}
-
-std::optional<BlockRef> WaitTipChanged(ChainstateManager& chainman, KernelNotifications& kernel_notifications, const uint256& current_tip, MillisecondsDouble& timeout, bool& interrupt)
-{
-    Assume(timeout >= 0ms); // No internal callers should use a negative timeout
-    if (timeout < 0ms) timeout = 0ms;
-    if (timeout > std::chrono::years{100}) timeout = std::chrono::years{100}; // Upper bound to avoid UB in std::chrono
-    auto deadline{std::chrono::steady_clock::now() + timeout};
-    {
-        WAIT_LOCK(kernel_notifications.m_tip_block_mutex, lock);
-        // For callers convenience, wait longer than the provided timeout
-        // during startup for the tip to be non-null. That way this function
-        // always returns valid tip information when possible and only
-        // returns null when shutting down, not when timing out.
-        kernel_notifications.m_tip_block_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(kernel_notifications.m_tip_block_mutex) {
-            return kernel_notifications.TipBlock() || chainman.m_interrupt || interrupt;
-        });
-        if (chainman.m_interrupt || interrupt) {
-            interrupt = false;
-            return {};
-        }
-        // At this point TipBlock is set, so continue to wait until it is
-        // different then `current_tip` provided by caller.
-        kernel_notifications.m_tip_block_cv.wait_until(lock, deadline, [&]() EXCLUSIVE_LOCKS_REQUIRED(kernel_notifications.m_tip_block_mutex) {
-            return Assume(kernel_notifications.TipBlock()) != current_tip || chainman.m_interrupt || interrupt;
-        });
-        if (chainman.m_interrupt || interrupt) {
-            interrupt = false;
-            return {};
+            m_requested_outpoints_by_txid.erase(it);
         }
     }
 
-    // Must release m_tip_block_mutex before getTip() locks cs_main, to
-    // avoid deadlocks.
-    return GetTip(chainman);
+    // A transactions and its ancestors will only be picked into a block when
+    // both the ancestor set feerate and the individual feerate meet the target
+    // feerate.
+    //
+    // We had to convince ourselves that after running the mini miner and
+    // picking all eligible transactions into our MockBlockTemplate, there
+    // could still be transactions remaining that have a lower individual
+    // feerate than their ancestor feerate. So here is an example:
+    //
+    //               ┌─────────────────┐
+    //               │                 │
+    //               │   Grandparent   │
+    //               │    1700 vB      │
+    //               │    1700 sats    │                    Target feerate: 10    s/vB
+    //               │       1 s/vB    │    GP Ancestor Set Feerate (ASFR):  1    s/vB
+    //               │                 │                           P1_ASFR:  9.84 s/vB
+    //               └──────▲───▲──────┘                           P2_ASFR:  2.47 s/vB
+    //                      │   │                                   C_ASFR: 10.27 s/vB
+    // ┌───────────────┐    │   │    ┌──────────────┐
+    // │               ├────┘   └────┤              │             ⇒ C_FR < TFR < C_ASFR
+    // │   Parent 1    │             │   Parent 2   │
+    // │    200 vB     │             │    200 vB    │
+    // │  17000 sats   │             │   3000 sats  │
+    // │     85 s/vB   │             │     15 s/vB  │
+    // │               │             │              │
+    // └───────────▲───┘             └───▲──────────┘
+    //             │                     │
+    //             │    ┌───────────┐    │
+    //             └────┤           ├────┘
+    //                  │   Child   │
+    //                  │  100 vB   │
+    //                  │  900 sats │
+    //                  │    9 s/vB │
+    //                  │           │
+    //                  └───────────┘
+    //
+    // We therefore calculate both the bump fee that is necessary to elevate
+    // the individual transaction to the target feerate:
+    //         target_feerate × tx_size - tx_fees
+    // and the bump fee that is necessary to bump the entire ancestor set to
+    // the target feerate:
+    //         target_feerate × ancestor_set_size - ancestor_set_fees
+    // By picking the maximum from the two, we ensure that a transaction meets
+    // both criteria.
+    for (const auto& [txid, outpoints] : m_requested_outpoints_by_txid) {
+        auto it = m_entries_by_txid.find(txid);
+        Assume(it != m_entries_by_txid.end());
+        if (it != m_entries_by_txid.end()) {
+            Assume(target_feerate.GetFee(it->second.GetSizeWithAncestors()) > std::min(it->second.GetModifiedFee(), it->second.GetModFeesWithAncestors()));
+            CAmount bump_fee_with_ancestors = target_feerate.GetFee(it->second.GetSizeWithAncestors()) - it->second.GetModFeesWithAncestors();
+            CAmount bump_fee_individual = target_feerate.GetFee(it->second.GetTxSize()) - it->second.GetModifiedFee();
+            const CAmount bump_fee{std::max(bump_fee_with_ancestors, bump_fee_individual)};
+            Assume(bump_fee >= 0);
+            for (const auto& outpoint : outpoints) {
+                m_bump_fees.emplace(outpoint, bump_fee);
+            }
+        }
+    }
+    return m_bump_fees;
 }
 
+std::optional<CAmount> MiniMiner::CalculateTotalBumpFees(const CFeeRate& target_feerate)
+{
+    if (!m_ready_to_calculate) return std::nullopt;
+    // Build a block template until the target feerate is hit.
+    BuildMockTemplate(target_feerate);
+
+    // All remaining ancestors that are not part of m_in_block must be bumped, but no other relatives
+    std::set<MockEntryMap::iterator, IteratorComparator> ancestors;
+    std::set<MockEntryMap::iterator, IteratorComparator> to_process;
+    for (const auto& [txid, outpoints] : m_requested_outpoints_by_txid) {
+        // Skip any ancestors that already have a miner score higher than the target feerate
+        // (already "made it" into the block)
+        if (m_in_block.contains(txid)) continue;
+        auto iter = m_entries_by_txid.find(txid);
+        if (iter == m_entries_by_txid.end()) continue;
+        to_process.insert(iter);
+        ancestors.insert(iter);
+    }
+
+    std::set<Txid> has_been_processed;
+    while (!to_process.empty()) {
+        auto iter = to_process.begin();
+        const CTransaction& tx = (*iter)->second.GetTx();
+        for (const auto& input : tx.vin) {
+            if (auto parent_it{m_entries_by_txid.find(input.prevout.hash)}; parent_it != m_entries_by_txid.end()) {
+                if (!has_been_processed.contains(input.prevout.hash)) {
+                    to_process.insert(parent_it);
+                }
+                ancestors.insert(parent_it);
+            }
+        }
+        has_been_processed.insert(tx.GetHash());
+        to_process.erase(iter);
+    }
+    const auto ancestor_package_size = std::accumulate(ancestors.cbegin(), ancestors.cend(), int64_t{0},
+        [](int64_t sum, const auto it) {return sum + it->second.GetTxSize();});
+    const auto ancestor_package_fee = std::accumulate(ancestors.cbegin(), ancestors.cend(), CAmount{0},
+        [](CAmount sum, const auto it) {return sum + it->second.GetModifiedFee();});
+    return target_feerate.GetFee(ancestor_package_size) - ancestor_package_fee;
+}
 } // namespace node
