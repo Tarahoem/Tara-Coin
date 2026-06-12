@@ -1852,6 +1852,10 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
         reward = (9 - subPeriod) * COIN / 100;
         if (reward < COIN / 100) reward = COIN / 100;
     }
+    // Hard cap: stop when unmined supply reaches 0
+    extern CAmount g_unminedSupply;
+    if (g_unminedSupply <= 0) return 0;
+    if (reward > g_unminedSupply) reward = g_unminedSupply;
     return reward;
 }
 CoinsViews::CoinsViews(DBParams db_params, CoinsViewOptions options)
