@@ -68,7 +68,7 @@ static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesi
 static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
     const char* pszTimestamp = "Rand manipulation case: The banks may walk, says analyst - FAWZ";
-    const CScript genesisOutputScript = CScript() << "04048a4d371d7eb2cb08e286d63bcc85c707003301539fd085d20249e603907c5d5f180f8fde0e68e00fea0e933ba277a4023538ef33a132e31e5ecd454341b43f9d"_hex << OP_CHECKSIG;
+    const CScript genesisOutputScript = CScript() << "04047a4a66ad948f2bb8842c5c3a66a86468ae2b8d9b787c46fa484c1f1c25f3e16ce82d0c711f38cc24bc35d4d1124a6056d695526557d640ca23a3c0cec65a21b5"_hex << OP_CHECKSIG;
     return CreateGenesisBlock(pszTimestamp, genesisOutputScript, nTime, nNonce, nBits, nVersion, genesisReward);
 }
 
@@ -82,6 +82,11 @@ public:
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 210000;
+        consensus.script_flag_exceptions.emplace( // BIP16 exception
+            uint256{"00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"}, SCRIPT_VERIFY_NONE);
+        consensus.script_flag_exceptions.emplace( // Taproot exception
+            uint256{"0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"}, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS);
+        consensus.BIP34Height = 227931;
         consensus.BIP34Hash = uint256{"000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"};
         consensus.BIP65Height = 388381; // 000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0
         consensus.BIP66Height = 363725; // 00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931
@@ -113,18 +118,18 @@ public:
         pchMessageStart[1] = 0xbe;
         pchMessageStart[2] = 0xb4;
         pchMessageStart[3] = 0xd9;
-        consensus.ministryInjectionPubKey = "04044870436f1c35515b5c294d986b55aefc795a53e33e2e610c2b9e57375e324a7375999ee1c06e5cbcc953a67dad5750053b88009a8abc16ac4feb138a683e7234";
+        consensus.ministryInjectionPubKey = "04043265b99cc0bcb7c257e33325774897f9f6c7fea5be62ed4877e46180a4ab448a93a16b7c5ac675b9adfc9f86d1ea42130b8fe7cdfdf627b297ccba09fb2db4bb";
         consensus.lpInjectionAmount = 3000000 * COIN;
         consensus.lpInjectionBlock = 720;
         nDefaultPort = 8333;
         nPruneAfterHeight = 100000;
-        m_assumed_blockchain_size = 0;
-        m_assumed_chain_state_size = 0;
+        m_assumed_blockchain_size = 856;
+        m_assumed_chain_state_size = 14;
 
-        genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN);
+        genesis = CreateGenesisBlock(1231006505, 2083236893, 0x1d00ffff, 1, 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        //assert(consensus.hashGenesisBlock == uint256{"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"});
-        //assert(genesis.hashMerkleRoot == uint256{"6f507513906378acfa2d2e41de8c36024f40a771fabe774d39adad1dd1242466"});
+        ////assert(consensus.hashGenesisBlock == uint256{"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"});
+        ////assert(genesis.hashMerkleRoot == uint256{"6f507513906378acfa2d2e41de8c36024f40a771fabe774d39adad1dd1242466"});
 
         // Note that of those which support the service bits prefix, most only support a subset of
         // possible options.
@@ -241,7 +246,7 @@ public:
 
         genesis = CreateGenesisBlock(1296688602, 414098458, 0x1d00ffff, 1, 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        //assert(consensus.hashGenesisBlock == uint256{"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"});
+        ////assert(consensus.hashGenesisBlock == uint256{"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"});
         //assert(genesis.hashMerkleRoot == uint256{"6f507513906378acfa2d2e41de8c36024f40a771fabe774d39adad1dd1242466"});
 
         vFixedSeeds.clear();
@@ -349,8 +354,8 @@ public:
                 1,
                 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        //assert(consensus.hashGenesisBlock == uint256{"00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"});
-        //assert(genesis.hashMerkleRoot == uint256{"7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"});
+        ////assert(consensus.hashGenesisBlock == uint256{"00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"});
+        ////assert(genesis.hashMerkleRoot == uint256{"7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"});
 
         vFixedSeeds.clear();
         vSeeds.clear();
@@ -481,7 +486,7 @@ public:
 
         genesis = CreateGenesisBlock(1598918400, 52613770, 0x1e0377ae, 1, 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        //assert(consensus.hashGenesisBlock == uint256{"00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"});
+        ////assert(consensus.hashGenesisBlock == uint256{"00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"});
         //assert(genesis.hashMerkleRoot == uint256{"6f507513906378acfa2d2e41de8c36024f40a771fabe774d39adad1dd1242466"});
 
         m_assumeutxo_data = {
