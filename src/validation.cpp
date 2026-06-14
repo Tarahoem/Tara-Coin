@@ -1834,29 +1834,8 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
 {
-    // Tara: Declining reward schedule
-    // Block 0 (genesis): 50 TARA
-    // Blocks 1-500: 1.0 TARA
-    // Blocks 501-1000: 0.9 TARA
-    // ... decreasing by 0.1 every 500 blocks ...
-    // Blocks 4501-5000: 0.09 TARA
-    // ... decreasing by 0.01 every 500 blocks ...
-    // Minimum: 0.01 TARA forever
-    if (nHeight == 0) return 50 * COIN;
-    int period = (nHeight - 1) / 500;
-    CAmount reward;
-    if (period < 9) {
-        reward = (10 - period) * COIN / 10;
-    } else {
-        int subPeriod = period - 9;
-        reward = (9 - subPeriod) * COIN / 100;
-        if (reward < COIN / 100) reward = COIN / 100;
-    }
-    // Hard cap: stop when unmined supply reaches 0
-    extern CAmount g_unminedSupply;
-    if (g_unminedSupply <= 0) return 0;
-    if (reward > g_unminedSupply) reward = g_unminedSupply;
-    return reward;
+    // Fixed reward: 0.01 TARA per block
+    return 0.01 * COIN;
 }
 CoinsViews::CoinsViews(DBParams db_params, CoinsViewOptions options)
     : m_dbview{std::move(db_params), std::move(options)},
@@ -2639,7 +2618,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     if (g_validatorRegistry.Size() > 0 && g_slashedCoinsPending > 0) {
         slashReward = g_slashedCoinsPending / g_validatorRegistry.Size();
         g_slashedCoinsPending = 0;
-        g_treasury.polBalance += slashReward;
+        // Slashed coins go to miners via nFees
+        nFees += slashReward;
     }
 
     // #8 Gaming/Metaverse: 0.5% per bet to LP (OP_BET)
@@ -2655,14 +2635,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             if (vout.scriptPubKey.size() < 1) continue;
             unsigned char op = vout.scriptPubKey[0];
             CAmount fee = 0;
-            if (op == OP_BET)           fee = (vout.nValue * 50) / 10000;   // 0.5%
-            if (op == OP_ESCROW)        fee = (vout.nValue * 10) / 10000;   // 0.1%
-            if (op == OP_API_ACCESS)    fee = (vout.nValue * 150) / 10000;  // 1.5%
-            if (op == OP_CARBON)        fee = (vout.nValue * 1) / 10000;    // 0.01%
-            if (op == OP_SHOP)          { fee = (vout.nValue * 50) / 10000; fee /= 2; } // 0.5% -> 50%
-            if (op == OP_VALIDATOR_DATA) fee = COIN / 100000000;             // 0.00000001 TARA
-            if (op == OP_TOKEN)         fee = (vout.nValue * 100) / 10000;  // 1%
-            if (op == OP_MERCHANT)      fee = (vout.nValue * 50) / 10000;   // 0.5%
+            if (op == OP_BET)           fee = 0;   // 0.5%
+            if (op == OP_ESCROW)        fee = 0;   // 0.1%
+            if (op == OP_API_ACCESS)    fee = 0;  // 1.5%
+            if (op == OP_CARBON)        fee = 0;    // 0.01%
+            if (op == OP_SHOP)          { fee = 0; fee /= 2; } // 0.5% -> 50%
+            if (op == OP_VALIDATOR_DATA) fee = 0;             // 0.00000001 TARA
+            if (op == OP_TOKEN)         fee = 0;  // 1%
+            if (op == OP_MERCHANT)      fee = 0;   // 0.5%
             if (fee > 0) {
                 g_treasury.polBalance += fee;
             }
